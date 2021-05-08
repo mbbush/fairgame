@@ -114,7 +114,7 @@ class AmazonMonitoringHandler(BaseStoreHandler):
     def __init__(
         self,
         notification_handler: NotificationHandler,
-        item_list: List[FGItem],
+        item_list: List[List[FGItem]],
         amazon_config,
         tasks=1,
         checkshipping=False,
@@ -136,11 +136,12 @@ class AmazonMonitoringHandler(BaseStoreHandler):
 
         # Initialize the Session we'll use for stock checking
         log.debug("Initializing Monitoring Sessions")
-        self.sessions_list: Optional[List[AmazonMonitor]] = []
+        self.sessions_list: List[AmazonMonitor] = []
         for idx in range(len(item_list)):
             connector = None
-            if self.proxies and idx < len(self.proxies):
-                connector = ProxyConnector.from_url(self.proxies[idx]["https"])
+            if self.proxies:
+                proxy_idx = idx % len(self.proxies)
+                connector = ProxyConnector.from_url(self.proxies[proxy_idx]["https"])
             self.sessions_list.append(
                 AmazonMonitor(
                     headers=HEADERS,
@@ -209,7 +210,7 @@ class AmazonMonitor(aiohttp.ClientSession):
         # Do first response outside of while loop, so we can continue on captcha checks
         # and return to start of while loop with that response. Requires the next response
         # to be grabbed at end of while loop
-        log.debug(f"Monitoring Task Started for {self.item.id}")
+        log.debug(f"Monitoring Task Started for {self.item.asin}")
 
         fail_counter = 0  # Count sequential get fails
         delay = self.delay
@@ -226,9 +227,10 @@ class AmazonMonitor(aiohttp.ClientSession):
             return
 
         check_count = 1
-        # Loop will only exit if a qualified seller is returned.
-        while True:
-            log.debug(f"{self.item.id} Stock Check Count: {check_count}")
+        # Loop will only exit if a qualified seller is returned, or the task is externally terminated by canceling
+        # its future.
+        while not future.cancelled():
+            log.debug(f"{self.item.asin} Stock Check Count: {check_count}")
             tree = check_response(response_text)
             if tree is not None:
                 if captcha_element := has_captcha(tree):
@@ -375,7 +377,7 @@ def get_item_sellers(
         if find_asin:
             found_asin = find_asin.group(1)
 
-    if found_asin != item.id:
+    if found_asin != item.asin:
         log.debug(
             f"Aborting Check, ASINs do not match. Found {found_asin}; Searching for {item.id}."
         )
@@ -385,7 +387,7 @@ def get_item_sellers(
     offers = tree.xpath("//div[@id='aod-sticky-pinned-offer'] | //div[@id='aod-offer']")
     # Exit if no offers found
     if not offers:
-        log.debug(f"No offers for {item.id} = {item.short_name}")
+        log.debug(f"No offers for {item.asin} = {item.short_name}")
         return sellers
     log.debug(f"Found {len(offers)} offers.")
     # Parse the found offers

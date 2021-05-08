@@ -1,3 +1,4 @@
+
 import json
 import time
 import typing
@@ -5,6 +6,8 @@ import asyncio
 from furl import furl
 from price_parser import parse_price, Price
 import inspect
+import itertools
+import functools
 
 from common.amazon_support import (
     AmazonItemCondition,
@@ -100,19 +103,36 @@ class AmazonStoreHandler(BaseStoreHandler):
             tasks=checkout_tasks,
         )
         log.debug("Creating checkout worker and monitoring task(s)")
-        future = []
-        for idx in range(len(amazon_monitoring.sessions_list)):
-            future.append(asyncio.Future())
-            future[idx].add_done_callback(recreate_session_callback)
+        # TODO: use loop.create_future()
+        checkout_future = asyncio.Future()
+        monitoring_futures = []
+        monitoring_tasks = []
+        # We have one FGItem for each ASIN. Group them by their idx so that we can end the search for all alternate
+        # ASINs when one is purchased, while continuing to look for other items.
+        fg_items_by_idx = itertools.groupby(self.item_list, lambda i: i.idx)
+        # each item gets a future that is completed whenever the first ASIN for that item is purchased. On completion,
+        # it completes its parent future, which then cancels the futures looking for all the other ASINs for that item.
+        item_futures = {idx: asyncio.Future() for idx, items in fg_items_by_idx}
+        sessions_with_items: List[Tuple[AmazonMonitor, FGItem]] = list(map(
+            lambda session: (session, session.item), amazon_monitoring.sessions_list))
+        for monitor, item in sessions_with_items:
+            # create a future, with a done callback that uses a partial function to either restart itself or complete its parent.
+            # register a callback for the parent to cancel this future
+            # append the coroutine for doing the stock check.
+            monitor_future = asyncio.Future()
+            monitoring_futures.append(monitor_future)
+            parent: asyncio.Future = item_futures[item.idx]
+            monitor_future.add_done_callback(functools.partial(recreate_session_callback, parent=parent))
+            parent.add_done_callback(lambda f: monitor_future.cancel())
+            checkout_future.add_done_callback(lambda f: monitor_future.cancel())
+            monitoring_tasks.append(monitor.stock_check(queue, monitor_future))
 
         await asyncio.gather(
-            amazon_checkout.checkout_worker(queue=queue),
-            *[
-                amazon_monitoring.sessions_list[idx].stock_check(queue, future[idx])
-                for idx in range(len(amazon_monitoring.sessions_list))
-            ],
+            amazon_checkout.checkout_worker(queue=queue, future=checkout_future, single_shot=self.single_shot),
+            *monitoring_tasks,
         )
         return
+
 
     def parse_config(self):
         log.debug(f"Processing config file from {CONFIG_FILE_PATH}")
@@ -133,7 +153,7 @@ class AmazonStoreHandler(BaseStoreHandler):
         log.debug(f"Found {len(self.item_list)} items to track at {STORE_NAME}.")
 
     def parse_items(self, json_items):
-        for json_item in json_items:
+        for idx, json_item in enumerate(json_items):
             if (
                 "max-price" in json_item
                 and "asins" in json_item
@@ -168,33 +188,37 @@ class AmazonStoreHandler(BaseStoreHandler):
                     )
                     # did the user forget to put us in an array?
                     asins_collection = asins_collection.split(",")
-                for asin in asins_collection:
-                    self.item_list.append(
-                        FGItem(
-                            asin,
-                            min_price,
-                            max_price,
-                            purchase_delay=json_item.get("purchase_delay", 0),
-                            condition=condition,
-                            merchant_id=merchant_id,
-                            furl=furl(
-                                url=f"https://smile.amazon.com/gp/aod/ajax?asin={asin}"
-                            ),
-                        )
-                    )
+                items = map(lambda asin: FGItem(
+                    asin,
+                    idx,
+                    min_price,
+                    max_price,
+                    purchase_delay=json_item.get("purchase_delay", 0),
+                    condition=condition,
+                    merchant_id=merchant_id,
+                    furl=furl(
+                        url=f"https://smile.amazon.com/gp/aod/ajax?asin={asin}"
+                    ),
+                ), asins_collection)
+                self.item_list.extend(items)
             else:
                 log.error(
                     f"Item isn't fully qualified.  Please include asin, min-price and max-price. {json_item}"
                 )
 
 
-def recreate_session_callback(future: asyncio.Future):
+def recreate_session_callback(future: asyncio.Future, parent: asyncio.Future):
     log.debug("Checking session result")
     global queue
-    if isinstance(future.result(), AmazonMonitor):
-        log.debug("session result is a monitoring class, recreating monitor")
-        session: AmazonMonitor = future.result()
-        future = asyncio.Future()
-        future.add_done_callback(recreate_session_callback)
-        asyncio.create_task(session.stock_check(queue=queue, future=future))
-        log.debug("New monitor task create")
+    if not future.cancelled():
+        if isinstance(future.result(), AmazonMonitor):
+            log.debug("session result is a monitoring class, recreating monitor")
+            session: AmazonMonitor = future.result()
+            future = asyncio.Future()
+            future.add_done_callback(functools.partial(recreate_session_callback, parent=parent))
+            parent.add_done_callback(lambda f: future.cancel())
+            asyncio.create_task(session.stock_check(queue=queue, future=future))
+            log.debug("New monitor task create")
+        else:
+            log.debug("session result is None. Completing parent so that it can cancel the other checks for the same item.")
+            parent.set_result(None)

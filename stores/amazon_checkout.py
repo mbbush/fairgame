@@ -398,7 +398,7 @@ class AmazonCheckoutHandler(BaseStoreHandler):
         except Exception as e:
             log.debug(f"Other error encountered while loading page: {e}")
 
-    async def checkout_worker(self, queue: asyncio.Queue):
+    async def checkout_worker(self, queue: asyncio.Queue, future: asyncio.Future, single_shot: bool = False):
         log.debug("Checkout Task Started")
         log.debug("Logging in and pulling cookies from Selenium")
         cookies = self.pull_cookies()
@@ -444,8 +444,10 @@ class AmazonCheckoutHandler(BaseStoreHandler):
                         save_html_response("order-confirm", status, text)
                     except aiohttp.ClientError:
                         log.debug("could not save order confirmation page")
-                    await self.checkout_session.close()
-                    break
+                    if single_shot:
+                        await self.checkout_session.close()
+                        future.set_result(None)
+                        break
 
     @contextmanager
     def wait_for_page_content_change(self, timeout=5):

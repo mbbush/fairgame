@@ -117,7 +117,8 @@ class SellerDetail:
 
 @attr.s(auto_attribs=True)
 class FGItem:
-    id: str
+    asin: str
+    idx: int
     min_price: Price
     max_price: Price
     purchase_delay: int = 0
